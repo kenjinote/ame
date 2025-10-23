@@ -48,8 +48,8 @@
 static const int TILE_SIZE = 256;
 static const int MIN_MAP_ZOOM = 2; // GSIマップの最小ズームを広めに設定
 static const int MAX_MAP_ZOOM = 18; // GSIマップの最大ズームを広めに設定
-static const int MIN_DL_ZOOM = 4; // JMAタイルの最小ズームに合わせる
-static const int MAX_DL_ZOOM = 13; // JMAタイルの最大ズームに合わせる
+static const int MIN_JMA_ZOOM = 4; // JMAタイルが公開されている最小ズーム
+static const int MAX_JMA_ZOOM = 10; // JMAタイルが公開されている最大ズーム (4, 6, 8, 10のどれかにマッピングされる)
 static const int DEFAULT_ZOOM = 6;
 static const int WORKER_THREADS = 4;
 
@@ -438,12 +438,13 @@ static void EnsureRT() {
 	}
 }
 
-// JMAナウキャストに使用する最適なズームレベルを決定する
+// JMAナウキャストに使用する最適なズームレベルを決定する (未使用だが定義削除のためコメントアウト)
+/*
 static int GetJmaZoomLevel(int zCurrent) {
 	// 現在のズームがJMAの範囲外の場合、最も近いズームを使用
 	return std::clamp(zCurrent, MIN_DL_ZOOM, MAX_DL_ZOOM);
 }
-
+*/
 
 static void DrawScene() {
 	EnsureRT();
@@ -466,8 +467,11 @@ static void DrawScene() {
 
 	// GSIマップの描画ロジック
 	auto drawGsiTiles = [&]() {
-		int maxT = (1 << zDL);
-		// 画面がカバーするタイル座標の範囲（zDL座標系）
+		// GSIタイルのズームレベルは zDL
+		int zGSI = zDL;
+		int maxT = (1 << zGSI);
+
+		// 画面がカバーするタイル座標の範囲（zGSI座標系）
 		int tx0 = (int)std::floor(wx0 / TILE_SIZE);
 		int ty0 = (int)std::floor(wy0 / TILE_SIZE);
 		int tx1 = (int)std::floor(wx1 / TILE_SIZE);
@@ -476,7 +480,16 @@ static void DrawScene() {
 		for (int ty = ty0; ty <= ty1; ++ty) {
 			for (int tx = tx0; tx <= tx1; ++tx) {
 				int nx = (tx % maxT + maxT) % maxT;
-				int ny = std::clamp(ty, 0, maxT - 1);
+
+				// Y方向の正規化されたタイル座標
+				int ny_clamped = std::clamp(ty, 0, maxT - 1);
+
+				// 修正: Y座標がクランプされた場合 (つまり、地図の南北の極外) はタイルを要求せずスキップする
+				if (ny_clamped != ty) {
+					continue;
+				}
+
+				int ny = ny_clamped;
 
 				double wx_start = tx * TILE_SIZE;
 				double wy_start = ty * TILE_SIZE;
@@ -489,52 +502,77 @@ static void DrawScene() {
 
 				if (dst.right > 0 && dst.left < g.clientW && dst.bottom > 0 && dst.top < g.clientH) {
 					wchar_t buf[512];
-					swprintf_s(buf, K_GSI_TILE_FMT, zDL, nx, ny);
+					swprintf_s(buf, K_GSI_TILE_FMT, zGSI, nx, ny);
 					std::wstring path = buf;
 
 					ID2D1Bitmap* bmp = nullptr;
+					// GSIタイルはisOverlay=false
 					if (GetOrFetchBitmap(path, &bmp, false) && bmp) {
 						g.rt->DrawBitmap(bmp, dst, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
 					}
+					// else: ダウンロード中/失敗。背景色（白）が見える。
 				}
 			}
 		}
 		};
 
-	// JMAナウキャストの描画ロジック
+	// JMAナウキャストの描画ロジック（全ズームレベル対応・背景地図と一致）
 	auto drawJmaOverlay = [&](int timeIndex, float alpha) {
 		if (gTimes.empty() || timeIndex < 0 || timeIndex >= gTimes.size()) return;
 
-		// JMAが実際に利用するズームレベルを決定
-		int current_floor_zoom = (int)std::floor(g.zoom);
+		double zCur = g.zoom;
 
-		// 修正ロジック: ズームが整数に一致する場合 (例: 7.00)、一つ下のズームレベルを参照する
-		int zJMA_candidate;
-		if (g.zoom == current_floor_zoom) {
-			// 整数ズームと一致する場合、フォールバック (例: Z=7.00 -> Z=6)
-			zJMA_candidate = current_floor_zoom - 1;
+		// 修正: JMAタイル公開ズームレベル (4, 6, 8, 10) に基づいて zJMA を決定する
+		int zJMA;
+		// ズームレベル境界での浮動小数点誤差を避けるため、zCurに微小なオフセットを適用
+		double zCur_adjusted = zCur + 1e-9;
+
+		if (zCur_adjusted < 6.0) {
+			zJMA = 4;
+		}
+		else if (zCur_adjusted < 8.0) {
+			zJMA = 6;
+		}
+		else if (zCur_adjusted < 10.0) {
+			zJMA = 8;
 		}
 		else {
-			// 分数ズームの場合、現在の整数部を使用 (例: Z=7.25 -> Z=7)
-			zJMA_candidate = current_floor_zoom;
+			// 10.0以上のズームレベルは全て Z=10 のタイルを拡大表示する
+			zJMA = 10;
 		}
 
-		// JMAが実際に利用するズームレベルを決定 (最小/最大でクランプ)
-		int zJMA = GetJmaZoomLevel(zJMA_candidate);
+		// zJMAがJMA最小ズーム (4)未満にならないことを保証
+		zJMA = std::max(zJMA, 4);
 
-		int maxT_JMA = (1 << zJMA);
-		NowcTime T = gTimes[timeIndex];
+		const int maxT_JMA = (1 << zJMA);
+		const NowcTime T = gTimes[timeIndex];
 
-		// zJMAタイルが zDL座標系で持つべき辺の長さ (タイル数)
-		double tile_count_factor = std::pow(2.0, zDL - zJMA); // 2^(zDL - zJMA)
+		// JMAタイルの世界座標系 (Z_JMA) の情報
+		double worldSizeAtZJMA = (double)TILE_SIZE * (1 << zJMA);
 
-		// 画面がカバーする JMA タイル座標の範囲 (zJMA座標系)
-		// 境界問題を回避するため、1タイル分バッファを持たせて範囲を拡大する
-		int tx0_JMA = (int)std::floor(wx0 / TILE_SIZE / tile_count_factor) - 1;
-		int ty0_JMA = (int)std::floor(wy0 / TILE_SIZE / tile_count_factor) - 1;
-		int tx1_JMA = (int)std::floor(wx1 / TILE_SIZE / tile_count_factor) + 1;
-		int ty1_JMA = (int)std::floor(wy1 / TILE_SIZE / tile_count_factor) + 1;
+		// 現在のGSIズームレベルZ_DLのワールド座標系からZ_JMAのワールド座標系への変換スケール
+		double Z_DL_to_Z_JMA_scale = std::pow(2.0, zJMA - zDL);
 
+		// GSIのzDL座標系でのJMAタイルが占めるワールド座標上のサイズ (タイル一つ分)
+		double tileWorldSizeZDL = worldSizeAtZJMA / std::pow(2.0, zJMA - zDL); // 簡略化すると TILE_SIZE * 2^(zDL - zJMA) の逆数になる
+
+		// JMAタイル座標の計算に必要なスケールファクター (zDL座標系からJMAタイル座標へ)
+		double invTileWorldSizeZDL = 1.0 / tileWorldSizeZDL;
+
+		// 1. Z_JMA座標系でのワールド座標を計算
+		double wx0_JMA = wx0 * Z_DL_to_Z_JMA_scale;
+		double wy0_JMA = wy0 * Z_DL_to_Z_JMA_scale;
+		double wx1_JMA = wx1 * Z_DL_to_Z_JMA_scale;
+		double wy1_JMA = wy1 * Z_DL_to_Z_JMA_scale;
+
+		// 2. タイル座標を決定 (Z_JMA座標系)
+		// 境界問題を回避するため、絶対座標系で計算し、微小なオフセットとバッファを適用
+		int tx0_JMA = (int)std::floor(wx0_JMA / TILE_SIZE - 0.001) - 1;
+		int ty0_JMA = (int)std::floor(wy0_JMA / TILE_SIZE - 0.001) - 1;
+		int tx1_JMA = (int)std::floor(wx1_JMA / TILE_SIZE + 0.001) + 1;
+		int ty1_JMA = (int)std::floor(wy1_JMA / TILE_SIZE + 0.001) + 1;
+
+		// タイルを順に描画
 		for (int ty_JMA = ty0_JMA; ty_JMA <= ty1_JMA; ++ty_JMA) {
 			for (int tx_JMA = tx0_JMA; tx_JMA <= tx1_JMA; ++tx_JMA) {
 				// JMAタイルの座標を正規化（X方向のみラップアラウンド）
@@ -542,16 +580,20 @@ static void DrawScene() {
 				// Y方向はクランプ処理
 				int ny = std::clamp(ty_JMA, 0, maxT_JMA - 1);
 
-				// JMAタイルのワールド座標での開始位置 (zDL座標系)
-				double wx_jma_start = tx_JMA * TILE_SIZE * tile_count_factor;
-				double wy_jma_start = ty_JMA * TILE_SIZE * tile_count_factor;
+				// JMAタイルのワールド座標での開始位置 (zDL座標系に戻す)
+				double wx_jma_start_ZJMA = (double)tx_JMA * TILE_SIZE;
+				double wy_jma_start_ZJMA = (double)ty_JMA * TILE_SIZE;
+
+				double wx_jma_start = wx_jma_start_ZJMA / Z_DL_to_Z_JMA_scale;
+				double wy_jma_start = wy_jma_start_ZJMA / Z_DL_to_Z_JMA_scale;
 
 				// 画面座標への変換
 				float sx = (float)((wx_jma_start - g.originWX) * current_scale);
 				float sy = (float)((wy_jma_start - g.originWY) * current_scale);
 
-				// 画面上の描画サイズ (JMAタイルのワールドサイズ * current_scale)
-				float draw_size = (float)(TILE_SIZE * current_scale * tile_count_factor);
+				// 画面上の描画サイズ (JMAタイルが zDL 座標系で占めるサイズ * current_scale)
+				double tileWorldSize_zDL_final = (double)TILE_SIZE / Z_DL_to_Z_JMA_scale;
+				float draw_size = (float)(tileWorldSize_zDL_final * current_scale);
 
 				D2D1_RECT_F dst = D2D1::RectF(sx, sy, sx + draw_size, sy + draw_size);
 
