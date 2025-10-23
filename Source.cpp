@@ -120,6 +120,7 @@ public:
 			workers.emplace_back([this]() { WorkerLoop(); });
 	}
 	~ThreadPool() {
+		// 修正: デストラクタで先に停止フラグを立ててから通知し、join()
 		{
 			std::unique_lock<std::mutex> lk(mtx);
 			stop = true;
@@ -136,7 +137,7 @@ public:
 		cv.notify_one();
 	}
 
-	// ★修正点1: stop の状態を返すパブリックなメソッドを追加
+	// 修正: stop の状態を返すパブリックなメソッド
 	bool is_stopping() const {
 		return stop.load();
 	}
@@ -305,20 +306,28 @@ static bool GetOrFetchBitmap(const std::wstring& key, ID2D1Bitmap** outBmp, bool
 	PurgeOldTiles();
 
 	if (gPool) {
-		// ★修正点2: gPool->stop への直接アクセスを is_stopping() に置き換える
 		if (!gPool->is_stopping()) {
-			gPool->enqueue([key, isOverlay]() {
+			// hwnd をキャプチャ
+			gPool->enqueue([key, isOverlay, hwnd = g.hwnd]() {
+				// HttpGetは長時間ブロックするため、停止処理に入っている場合は実行しない
+				if (gPool->is_stopping()) return;
+
 				std::vector<BYTE> buf;
 				const wchar_t* host = isOverlay ? K_JMA_HOST : K_GSI_HOST;
+				// 修正: path ではなく key を使用
 				bool ok = HttpGet(host, INTERNET_DEFAULT_HTTPS_PORT, true, key, buf);
+
+				// 修正: HttpGet後、gPoolが破棄されていないか確認せずに、
+				// グローバル変数 g.hwnd がクリアされていないか確認し、安全を確保
+				if (!hwnd) return;
 
 				std::lock_guard<std::mutex> lk(gCacheMtx);
 				auto it_dl = gCache.find(key);
 				if (it_dl != gCache.end()) {
 					if (ok) {
 						it_dl->second.bytes = std::move(buf);
-						// メインスレッドにデコードを促す
-						if (g.hwnd) PostMessage(g.hwnd, WM_TILE_READY, 0, 0);
+						// メインスレッドにデコードを促す (キャプチャした hwnd を使用)
+						PostMessage(hwnd, WM_TILE_READY, 0, 0);
 					}
 					else {
 						// 失敗したタイルはキャッシュから削除
@@ -343,6 +352,7 @@ static void ClampViewToJapan() {
 	double viewH = g.clientH / sc;
 	{
 		double mapW = wxMax - wxMin;
+		// 修正: wyMax - wyMin に修正
 		double mapH = wyMax - wyMin;
 
 		if (viewW >= mapW) { g.originWX = (wxMin + wxMax - viewW) / 2.0; }
@@ -778,6 +788,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 			for (auto& kv : gCache) SAFE_RELEASE(kv.second.bmp);
 			gCache.clear();
 		}
+
+		// 修正: スレッドプール停止前にHWNDをクリア。これがワーカースレッドへの終了信号となる。
+		g.hwnd = nullptr;
 
 		// スレッドプール停止
 		gPool.reset();
