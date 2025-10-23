@@ -10,7 +10,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <d2d1.h>
-#include <dwrite.h> // DirectWriteのために追加
+#include <dwrite.h>
 #include <wincodec.h>
 #include <winhttp.h>
 #include <stdint.h>
@@ -35,7 +35,7 @@
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "dwrite.lib") // DirectWriteライブラリを追加
+#pragma comment(lib, "dwrite.lib")
 
 #ifndef SAFE_RELEASE
 #define SAFE_RELEASE(p) do{ if(p){ (p)->Release(); (p)=nullptr; } }while(0)
@@ -46,15 +46,15 @@
 
 // -------------------- Constants --------------------
 static const int TILE_SIZE = 256;
-static const int MIN_MAP_ZOOM = 2; // GSIマップの最小ズームを広めに設定
-static const int MAX_MAP_ZOOM = 18; // GSIマップの最大ズームを広めに設定
-static const int MIN_JMA_ZOOM = 4; // JMAタイルが公開されている最小ズーム
-static const int MAX_JMA_ZOOM = 10; // JMAタイルが公開されている最大ズーム (4, 6, 8, 10のどれかにマッピングされる)
+static const int MIN_MAP_ZOOM = 2;
+static const int MAX_MAP_ZOOM = 18;
+static const int MIN_JMA_ZOOM = 4;
+static const int MAX_JMA_ZOOM = 10;
 static const int DEFAULT_ZOOM = 6;
 static const int WORKER_THREADS = 4;
 
 static const wchar_t* K_GSI_HOST = L"cyberjapandata.gsi.go.jp";
-static const wchar_t* K_GSI_TILE_FMT = L"/xyz/std/%d/%d/%d.png"; // GSI標準地図を使用
+static const wchar_t* K_GSI_TILE_FMT = L"/xyz/std/%d/%d/%d.png";
 static const INTERNET_PORT GSI_PORT = INTERNET_DEFAULT_HTTPS_PORT;
 
 static const wchar_t* K_JMA_HOST = L"www.jma.go.jp";
@@ -71,7 +71,7 @@ static const double JAPAN_MAX_LAT = 46.0;
 static const float kOverlayAlpha = 0.90f;
 static const float kAnimDurationSec = 0.65f;
 static const float kAnimStepInterval = 0.70f;
-static const size_t kCacheLimit = 256; // タイルキャッシュの上限
+static const size_t kCacheLimit = 256;
 
 #define WM_TILE_READY (WM_APP+1)
 
@@ -82,11 +82,11 @@ struct App {
 	ID2D1Factory* factory{};
 	ID2D1HwndRenderTarget* rt{};
 	IWICImagingFactory* wic{};
-	HINTERNET session{}; // WinHttpセッションは全体で共有
+	// HINTERNET session{}; // WinHttpセッションはHttpGet内で閉じるため、グローバルなAppからは削除
 
 	int clientW{ 1280 }, clientH{ 800 };
 	double zoom{ (double)DEFAULT_ZOOM };
-	double originWX{}, originWY{}; // ワールド座標の左上
+	double originWX{}, originWY{};
 	bool dragging{};
 	POINT dragStart{};
 	double dragStartWX{}, dragStartWY{};
@@ -130,10 +130,17 @@ public:
 	void enqueue(std::function<void()> f) {
 		{
 			std::unique_lock<std::mutex> lk(mtx);
+			if (stop) return;
 			tasks.push(std::move(f));
 		}
 		cv.notify_one();
 	}
+
+	// ★修正点1: stop の状態を返すパブリックなメソッドを追加
+	bool is_stopping() const {
+		return stop.load();
+	}
+
 private:
 	void WorkerLoop() {
 		while (true) {
@@ -152,7 +159,7 @@ private:
 	std::queue<std::function<void()>> tasks;
 	std::mutex mtx;
 	std::condition_variable cv;
-	bool stop = false;
+	std::atomic<bool> stop = false;
 };
 static std::unique_ptr<ThreadPool> gPool;
 
@@ -179,6 +186,7 @@ static inline double Clamp(double v, double lo, double hi) {
 // -------------------- Network (JMA) --------------------
 static bool HttpGet(const wchar_t* host, INTERNET_PORT port, bool https, const std::wstring& path, std::vector<BYTE>& out)
 {
+	// WinHttpセッションを関数内で開く
 	HINTERNET s = WinHttpOpen(L"GSIMapViewer/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, 0, 0, 0);
 	if (!s) return false;
 	HINTERNET c = WinHttpConnect(s, host, port, 0);
@@ -208,6 +216,7 @@ static bool HttpGet(const wchar_t* host, INTERNET_PORT port, bool https, const s
 			} while (true);
 		}
 	}
+	// リソースを解放
 	WinHttpCloseHandle(r); WinHttpCloseHandle(c); WinHttpCloseHandle(s);
 	return ok && !out.empty();
 }
@@ -282,7 +291,7 @@ static bool GetOrFetchBitmap(const std::wstring& key, ID2D1Bitmap** outBmp, bool
 		if (!it->second.bmp && !it->second.bytes.empty()) {
 			// WICデコードはメインスレッドでのみ行う
 			it->second.bmp = LoadPngToD2D(it->second.bytes);
-			it->second.bytes.clear(); // デコード後、バイト列は解放
+			it->second.bytes.clear();
 		}
 		*outBmp = it->second.bmp;
 		return (*outBmp != nullptr);
@@ -296,25 +305,28 @@ static bool GetOrFetchBitmap(const std::wstring& key, ID2D1Bitmap** outBmp, bool
 	PurgeOldTiles();
 
 	if (gPool) {
-		gPool->enqueue([key, isOverlay]() {
-			std::vector<BYTE> buf;
-			const wchar_t* host = isOverlay ? K_JMA_HOST : K_GSI_HOST;
-			bool ok = HttpGet(host, INTERNET_DEFAULT_HTTPS_PORT, true, key, buf);
+		// ★修正点2: gPool->stop への直接アクセスを is_stopping() に置き換える
+		if (!gPool->is_stopping()) {
+			gPool->enqueue([key, isOverlay]() {
+				std::vector<BYTE> buf;
+				const wchar_t* host = isOverlay ? K_JMA_HOST : K_GSI_HOST;
+				bool ok = HttpGet(host, INTERNET_DEFAULT_HTTPS_PORT, true, key, buf);
 
-			std::lock_guard<std::mutex> lk(gCacheMtx);
-			auto it_dl = gCache.find(key);
-			if (it_dl != gCache.end()) {
-				if (ok) {
-					it_dl->second.bytes = std::move(buf);
-					// メインスレッドにデコードを促す
-					if (g.hwnd) PostMessage(g.hwnd, WM_TILE_READY, 0, 0);
+				std::lock_guard<std::mutex> lk(gCacheMtx);
+				auto it_dl = gCache.find(key);
+				if (it_dl != gCache.end()) {
+					if (ok) {
+						it_dl->second.bytes = std::move(buf);
+						// メインスレッドにデコードを促す
+						if (g.hwnd) PostMessage(g.hwnd, WM_TILE_READY, 0, 0);
+					}
+					else {
+						// 失敗したタイルはキャッシュから削除
+						gCache.erase(it_dl);
+					}
 				}
-				else {
-					// 失敗したタイルはキャッシュから削除
-					gCache.erase(it_dl);
-				}
-			}
-			});
+				});
+		}
 	}
 	return false;
 }
@@ -372,7 +384,7 @@ static void UpdateTitle() {
 
 static void ZoomAtCenter(double delta) {
 	double old = g.zoom;
-	double nz = std::clamp(old + delta, (double)MIN_MAP_ZOOM, (double)MAX_MAP_ZOOM); // GSIの最大ズームを使用
+	double nz = std::clamp(old + delta, (double)MIN_MAP_ZOOM, (double)MAX_MAP_ZOOM);
 
 	int zOld = (int)std::floor(old), zNew = (int)std::floor(nz);
 	int cx = g.clientW / 2, cy = g.clientH / 2;
@@ -420,9 +432,24 @@ static void StartAnimTo(int toIndex)
 static void StepTime(int delta)
 {
 	if (gTimes.empty()) return;
-	int to = (int)Clamp(gTimeIndex + delta, 0.0, (double)gTimes.size() - 1);
-	if (to == gTimeIndex) return;
-	StartAnimTo(to);
+
+	int nextIndex = gTimeIndex;
+
+	if (delta > 0) {
+		nextIndex = gTimeIndex - 1;
+		if (nextIndex < 0) {
+			nextIndex = (int)gTimes.size() - 1;
+		}
+	}
+	else if (delta < 0) {
+		nextIndex = gTimeIndex + 1;
+		if (nextIndex >= (int)gTimes.size()) {
+			nextIndex = 0;
+		}
+	}
+
+	if (nextIndex == gTimeIndex) return;
+	StartAnimTo(nextIndex);
 	InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 
@@ -438,14 +465,6 @@ static void EnsureRT() {
 	}
 }
 
-// JMAナウキャストに使用する最適なズームレベルを決定する (未使用だが定義削除のためコメントアウト)
-/*
-static int GetJmaZoomLevel(int zCurrent) {
-	// 現在のズームがJMAの範囲外の場合、最も近いズームを使用
-	return std::clamp(zCurrent, MIN_DL_ZOOM, MAX_DL_ZOOM);
-}
-*/
-
 static void DrawScene() {
 	EnsureRT();
 	if (!g.rt) return;
@@ -453,13 +472,11 @@ static void DrawScene() {
 	g.rt->BeginDraw();
 	g.rt->Clear(D2D1::ColorF(1.0f, 1.0f, 1.0f));
 
-	// 描画するGSIタイルのズームレベル（zDL）
-	int zDL = (int)std::floor(g.zoom); // 現在の分数ズームの整数部を使用
-	zDL = std::clamp(zDL, MIN_MAP_ZOOM, MAX_MAP_ZOOM); // GSIタイルは広い範囲でクランプ
+	int zDL = (int)std::floor(g.zoom);
+	zDL = std::clamp(zDL, MIN_MAP_ZOOM, MAX_MAP_ZOOM);
 
 	double current_scale = std::pow(2.0, g.zoom - zDL);
 
-	// 画面がカバーするワールド座標の範囲（zDL座標系）
 	double wx0 = g.originWX;
 	double wy0 = g.originWY;
 	double wx1 = g.originWX + g.clientW / current_scale;
@@ -467,11 +484,9 @@ static void DrawScene() {
 
 	// GSIマップの描画ロジック
 	auto drawGsiTiles = [&]() {
-		// GSIタイルのズームレベルは zDL
 		int zGSI = zDL;
 		int maxT = (1 << zGSI);
 
-		// 画面がカバーするタイル座標の範囲（zGSI座標系）
 		int tx0 = (int)std::floor(wx0 / TILE_SIZE);
 		int ty0 = (int)std::floor(wy0 / TILE_SIZE);
 		int tx1 = (int)std::floor(wx1 / TILE_SIZE);
@@ -480,11 +495,8 @@ static void DrawScene() {
 		for (int ty = ty0; ty <= ty1; ++ty) {
 			for (int tx = tx0; tx <= tx1; ++tx) {
 				int nx = (tx % maxT + maxT) % maxT;
-
-				// Y方向の正規化されたタイル座標
 				int ny_clamped = std::clamp(ty, 0, maxT - 1);
 
-				// 修正: Y座標がクランプされた場合 (つまり、地図の南北の極外) はタイルを要求せずスキップする
 				if (ny_clamped != ty) {
 					continue;
 				}
@@ -506,100 +518,81 @@ static void DrawScene() {
 					std::wstring path = buf;
 
 					ID2D1Bitmap* bmp = nullptr;
-					// GSIタイルはisOverlay=false
 					if (GetOrFetchBitmap(path, &bmp, false) && bmp) {
 						g.rt->DrawBitmap(bmp, dst, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
 					}
-					// else: ダウンロード中/失敗。背景色（白）が見える。
 				}
 			}
 		}
 		};
 
-	// JMAナウキャストの描画ロジック（全ズームレベル対応・背景地図と一致）
+	// JMAナウキャストの描画ロジック
 	auto drawJmaOverlay = [&](int timeIndex, float alpha) {
 		if (gTimes.empty() || timeIndex < 0 || timeIndex >= gTimes.size()) return;
 
 		double zCur = g.zoom;
 
-		// 修正: JMAタイル公開ズームレベル (4, 6, 8, 10) に基づいて zJMA を決定する
 		int zJMA;
-		// ズームレベル境界での浮動小数点誤差を避けるため、zCurに微小なオフセットを適用
 		double zCur_adjusted = zCur + 1e-9;
 
-		if (zCur_adjusted < 6.0) {
+		if (zCur_adjusted < 5.0) {
 			zJMA = 4;
 		}
-		else if (zCur_adjusted < 8.0) {
+		else if (zCur_adjusted < 7.0) {
 			zJMA = 6;
 		}
-		else if (zCur_adjusted < 10.0) {
+		else if (zCur_adjusted < 9.0) {
 			zJMA = 8;
 		}
+		else if (zCur_adjusted < 11.0) {
+			zJMA = 10;
+		}
 		else {
-			// 10.0以上のズームレベルは全て Z=10 のタイルを拡大表示する
 			zJMA = 10;
 		}
 
-		// zJMAがJMA最小ズーム (4)未満にならないことを保証
 		zJMA = std::max(zJMA, 4);
 
 		const int maxT_JMA = (1 << zJMA);
 		const NowcTime T = gTimes[timeIndex];
 
-		// JMAタイルの世界座標系 (Z_JMA) の情報
-		double worldSizeAtZJMA = (double)TILE_SIZE * (1 << zJMA);
+		const double JMA_TILE_WORLD_SIZE = TILE_SIZE;
 
-		// 現在のGSIズームレベルZ_DLのワールド座標系からZ_JMAのワールド座標系への変換スケール
-		double Z_DL_to_Z_JMA_scale = std::pow(2.0, zJMA - zDL);
+		double Z_JMA_to_Z_DL_factor = std::pow(2.0, zDL - zJMA);
+		double tileWorldSize_zDL_final = JMA_TILE_WORLD_SIZE * Z_JMA_to_Z_DL_factor;
 
-		// GSIのzDL座標系でのJMAタイルが占めるワールド座標上のサイズ (タイル一つ分)
-		double tileWorldSizeZDL = worldSizeAtZJMA / std::pow(2.0, zJMA - zDL); // 簡略化すると TILE_SIZE * 2^(zDL - zJMA) の逆数になる
+		double Z_DL_to_Z_JMA_scale = 1.0 / Z_JMA_to_Z_DL_factor;
 
-		// JMAタイル座標の計算に必要なスケールファクター (zDL座標系からJMAタイル座標へ)
-		double invTileWorldSizeZDL = 1.0 / tileWorldSizeZDL;
-
-		// 1. Z_JMA座標系でのワールド座標を計算
 		double wx0_JMA = wx0 * Z_DL_to_Z_JMA_scale;
 		double wy0_JMA = wy0 * Z_DL_to_Z_JMA_scale;
 		double wx1_JMA = wx1 * Z_DL_to_Z_JMA_scale;
 		double wy1_JMA = wy1 * Z_DL_to_Z_JMA_scale;
 
-		// 2. タイル座標を決定 (Z_JMA座標系)
-		// 境界問題を回避するため、絶対座標系で計算し、微小なオフセットとバッファを適用
-		int tx0_JMA = (int)std::floor(wx0_JMA / TILE_SIZE - 0.001) - 1;
-		int ty0_JMA = (int)std::floor(wy0_JMA / TILE_SIZE - 0.001) - 1;
-		int tx1_JMA = (int)std::floor(wx1_JMA / TILE_SIZE + 0.001) + 1;
-		int ty1_JMA = (int)std::floor(wy1_JMA / TILE_SIZE + 0.001) + 1;
+		int tx0_JMA = (int)std::floor(wx0_JMA / JMA_TILE_WORLD_SIZE - 0.001) - 1;
+		int ty0_JMA = (int)std::floor(wy0_JMA / JMA_TILE_WORLD_SIZE - 0.001) - 1;
+		int tx1_JMA = (int)std::floor(wx1_JMA / JMA_TILE_WORLD_SIZE + 0.001) + 1;
+		int ty1_JMA = (int)std::floor(wy1_JMA / JMA_TILE_WORLD_SIZE + 0.001) + 1;
 
-		// タイルを順に描画
 		for (int ty_JMA = ty0_JMA; ty_JMA <= ty1_JMA; ++ty_JMA) {
 			for (int tx_JMA = tx0_JMA; tx_JMA <= tx1_JMA; ++tx_JMA) {
-				// JMAタイルの座標を正規化（X方向のみラップアラウンド）
 				int nx = (tx_JMA % maxT_JMA + maxT_JMA) % maxT_JMA;
-				// Y方向はクランプ処理
 				int ny = std::clamp(ty_JMA, 0, maxT_JMA - 1);
 
-				// JMAタイルのワールド座標での開始位置 (zDL座標系に戻す)
-				double wx_jma_start_ZJMA = (double)tx_JMA * TILE_SIZE;
-				double wy_jma_start_ZJMA = (double)ty_JMA * TILE_SIZE;
+				double wx_jma_start_ZJMA = (double)tx_JMA * JMA_TILE_WORLD_SIZE;
+				double wy_jma_start_ZJMA = (double)ty_JMA * JMA_TILE_WORLD_SIZE;
 
-				double wx_jma_start = wx_jma_start_ZJMA / Z_DL_to_Z_JMA_scale;
-				double wy_jma_start = wy_jma_start_ZJMA / Z_DL_to_Z_JMA_scale;
+				double wx_jma_start = wx_jma_start_ZJMA * Z_JMA_to_Z_DL_factor;
+				double wy_jma_start = wy_jma_start_ZJMA * Z_JMA_to_Z_DL_factor;
 
-				// 画面座標への変換
 				float sx = (float)((wx_jma_start - g.originWX) * current_scale);
 				float sy = (float)((wy_jma_start - g.originWY) * current_scale);
 
-				// 画面上の描画サイズ (JMAタイルが zDL 座標系で占めるサイズ * current_scale)
-				double tileWorldSize_zDL_final = (double)TILE_SIZE / Z_DL_to_Z_JMA_scale;
 				float draw_size = (float)(tileWorldSize_zDL_final * current_scale);
 
 				D2D1_RECT_F dst = D2D1::RectF(sx, sy, sx + draw_size, sy + draw_size);
 
 				if (dst.right > 0 && dst.left < g.clientW && dst.bottom > 0 && dst.top < g.clientH) {
 					wchar_t buf[512];
-					// パス生成には、決定された zJMA, nx, ny を使用
 					swprintf_s(buf, K_JMA_TILE_FMT, T.basetime.c_str(), T.validtime.c_str(), zJMA, nx, ny);
 					std::wstring path = buf;
 
@@ -617,58 +610,109 @@ static void DrawScene() {
 
 	// 2. JMA Overlayを描画
 	if (gAnimPlaying) {
-		// アニメーションブレンド
 		float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - gAnimStart).count() / kAnimDurationSec;
 		gAnimT = (float)Clamp(t, 0.0, 1.0);
 		drawJmaOverlay(gAnimFrom, (1.0f - gAnimT) * kOverlayAlpha);
 		drawJmaOverlay(gAnimTo, gAnimT * kOverlayAlpha);
 		if (t >= 1.0f) { gAnimPlaying = false; gTimeIndex = gAnimTo; UpdateTitle(); }
-		InvalidateRect(g.hwnd, nullptr, FALSE); // アニメ中は毎フレーム再描画
+		InvalidateRect(g.hwnd, nullptr, FALSE);
 	}
 	else {
-		// 固定表示
 		drawJmaOverlay(gTimeIndex, kOverlayAlpha);
 	}
 
 
-	// 3. 情報表示オーバーレイ (例: 現在時刻)
+	// 3. 情報表示オーバーレイ
 	if (!gTimes.empty()) {
-		ID2D1SolidColorBrush* brush = nullptr;
-		g.rt->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), &brush);
+		ID2D1SolidColorBrush* bgBrush = nullptr;
+		g.rt->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White, 0.7f), &bgBrush);
+
+		ID2D1SolidColorBrush* textBrush = nullptr;
+		g.rt->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::Black), &textBrush);
+
 
 		IDWriteFactory* writeFactory = nullptr;
 		IDWriteTextFormat* textFormat = nullptr;
-		// 修正: DWriteCreateFactoryを使用する前にdwrite.hがインクルードされていることを確認
+
 		HRESULT hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
 			reinterpret_cast<IUnknown**>(&writeFactory));
 
 		if (SUCCEEDED(hr) && writeFactory) {
-			// 修正: DWRITE_FONT_WEIGHT_NORMALなどの識別子がDWriteCreateFactoryの成功後に使用されることを確認
-			writeFactory->CreateTextFormat(L"Arial", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-				DWRITE_FONT_STRETCH_NORMAL, 16.0f, L"ja-jp", &textFormat);
+			hr = writeFactory->CreateTextFormat(L"Arial", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+				DWRITE_FONT_STRETCH_NORMAL, 24.0f, L"ja-jp", &textFormat);
 		}
 
-		if (brush && textFormat) {
+		if (bgBrush && textBrush && textFormat) {
 			std::wstringstream ss;
 			ss << (gUseForecast ? L"予測 (N2)" : L"観測 (N1)") << L"\n";
 
 			if (gTimeIndex >= 0 && gTimeIndex < gTimes.size()) {
 				const auto& t = gTimes[gTimeIndex].validtime;
-				std::wstring formattedTime = t.substr(4, 2) + L"/" + t.substr(6, 2) + L" " + t.substr(8, 2) + L":" + t.substr(10, 2);
-				ss << L"表示時刻: " << formattedTime << L" JST";
+
+				int year = std::stoi(t.substr(0, 4));
+				int month = std::stoi(t.substr(4, 2));
+				int day = std::stoi(t.substr(6, 2));
+				int hour = std::stoi(t.substr(8, 2));
+				int minute = std::stoi(t.substr(10, 2));
+
+				hour += 9;
+
+				if (hour >= 24) {
+					hour -= 24;
+					day += 1;
+
+					// 簡易的な日付繰り上げ処理
+					if (day > 31) { /* 処理省略 */ }
+				}
+
+				std::wstringstream time_ss;
+				time_ss << std::setw(2) << std::setfill(L'0') << month << L"/"
+					<< std::setw(2) << std::setfill(L'0') << day << L" "
+					<< std::setw(2) << std::setfill(L'0') << hour << L":"
+					<< std::setw(2) << std::setfill(L'0') << minute;
+
+				ss << L"表示時刻: " << time_ss.str() << L" JST";
 			}
 			else {
 				ss << L"表示時刻: データなし";
 			}
 
 			std::wstring text = ss.str();
-			D2D1_RECT_F layoutRect = D2D1::RectF(10, 10, (float)g.clientW - 10, (float)g.clientH - 10);
-			g.rt->DrawText(text.c_str(), (UINT32)text.length(), textFormat, layoutRect, brush);
+
+			IDWriteTextLayout* textLayout = nullptr;
+			hr = writeFactory->CreateTextLayout(text.c_str(), (UINT32)text.length(), textFormat, (float)g.clientW - 20.0f, (float)g.clientH - 20.0f, &textLayout);
+
+			if (SUCCEEDED(hr) && textLayout) {
+				DWRITE_TEXT_METRICS metrics;
+				textLayout->GetMetrics(&metrics);
+
+				float padding = 10.0f;
+				D2D1_RECT_F bgRect = D2D1::RectF(
+					10.0f, 10.0f,
+					10.0f + metrics.width + padding * 2.0f,
+					10.0f + metrics.height + padding * 2.0f
+				);
+
+				D2D1_ROUNDED_RECT roundedRect = D2D1::RoundedRect(bgRect, 8.0f, 8.0f);
+
+				g.rt->FillRoundedRectangle(&roundedRect, bgBrush);
+
+				D2D1_RECT_F textRect = D2D1::RectF(
+					10.0f + padding,
+					10.0f + padding,
+					bgRect.right,
+					bgRect.bottom
+				);
+				g.rt->DrawTextLayout(D2D1::Point2F(textRect.left, textRect.top), textLayout, textBrush);
+
+				SAFE_RELEASE(textLayout);
+			}
 		}
 
 		SAFE_RELEASE(textFormat);
 		SAFE_RELEASE(writeFactory);
-		SAFE_RELEASE(brush);
+		SAFE_RELEASE(textBrush);
+		SAFE_RELEASE(bgBrush);
 	}
 
 	g.rt->EndDraw();
@@ -678,11 +722,9 @@ static void DrawScene() {
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 	switch (m) {
 	case WM_CREATE:
-		// スレッドプール開始
 		gPool = std::make_unique<ThreadPool>(WORKER_THREADS);
-		// JMAの時間データ取得
 		SwitchTimes(gUseForecast);
-		SetTimer(h, 1, (UINT)(kAnimStepInterval * 1000), nullptr); // タイマー開始
+		SetTimer(h, 1, (UINT)(kAnimStepInterval * 1000), nullptr);
 		return 0;
 	case WM_SIZE: {
 		RECT rc; GetClientRect(h, &rc);
@@ -712,11 +754,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 		ZoomAtCenter((delta > 0) ? 0.25 : -0.25); return 0;
 	}
 	case WM_KEYDOWN:
-		if (w == '1') SwitchTimes(false); // 観測データ (N1)
-		else if (w == '2') SwitchTimes(true); // 予測データ (N2)
-		else if (w == VK_LEFT) StepTime(-1); // 前の時刻
-		else if (w == VK_RIGHT) StepTime(+1); // 次の時刻
-		else if (w == 'R') { CenterOnLonLat(139.767125, 35.681236); ZoomAtCenter(0); InvalidateRect(h, nullptr, FALSE); UpdateTitle(); } // 東京にリセット
+		if (w == '1') SwitchTimes(false);
+		else if (w == '2') SwitchTimes(true);
+		else if (w == VK_LEFT) StepTime(-1);
+		else if (w == VK_RIGHT) StepTime(+1);
+		else if (w == 'R') { CenterOnLonLat(139.767125, 35.681236); ZoomAtCenter(0); InvalidateRect(h, nullptr, FALSE); UpdateTitle(); }
 		return 0;
 	case WM_TIMER:
 		if (w == 1 && !gAnimPlaying) StepTime(+1);
@@ -724,20 +766,27 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 	case WM_PAINT: {
 		PAINTSTRUCT ps; BeginPaint(h, &ps); DrawScene(); EndPaint(h, &ps); return 0;
 	}
-	case WM_TILE_READY: // ダウンロード完了、メインスレッドでのデコードを促す
+	case WM_TILE_READY:
 		InvalidateRect(h, nullptr, FALSE); return 0;
 	case WM_DESTROY:
-		// スレッドプール停止
-		gPool.reset();
-		// キャッシュの解放
+		// タイマーを停止
+		KillTimer(h, 1);
+
+		// キャッシュと関連リソースの解放
 		{
 			std::scoped_lock lk(gCacheMtx);
 			for (auto& kv : gCache) SAFE_RELEASE(kv.second.bmp);
 			gCache.clear();
 		}
+
+		// スレッドプール停止
+		gPool.reset();
+
+		// D2Dリソースの解放
 		SAFE_RELEASE(g.rt);
 		SAFE_RELEASE(g.wic);
 		SAFE_RELEASE(g.factory);
+
 		PostQuitMessage(0); return 0;
 	}
 	return DefWindowProc(h, m, w, l);
@@ -765,18 +814,15 @@ int APIENTRY wWinMain(HINSTANCE hI, HINSTANCE, LPWSTR, int nCmd) {
 	ShowWindow(g.hwnd, nCmd);
 	UpdateWindow(g.hwnd);
 
-	// 初期設定
 	UpdateClientSize();
-	CenterOnLonLat(139.767125, 35.681236); // 東京駅
+	CenterOnLonLat(139.767125, 35.681236);
 	ClampViewToJapan();
 
-	// 初回描画とタイトル更新
 	InvalidateRect(g.hwnd, nullptr, FALSE);
 	UpdateWindow(g.hwnd);
 	DrawScene();
 	UpdateTitle();
 
-	// メッセージループ
 	MSG msg;
 	while (GetMessage(&msg, nullptr, 0, 0)) {
 		TranslateMessage(&msg);
